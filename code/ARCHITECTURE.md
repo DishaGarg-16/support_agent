@@ -16,20 +16,27 @@ The pipeline uses a two-pass architecture. First, it parses all tickets and runs
 
 ```mermaid
 flowchart TD
-    A[CSV Tickets] --> B[Parse all JSONs]
-    B --> C[Batch Classify Complexity]
-    C --> D[Async Concurrent Processing]
-    D --> E[Safety checks]
-    E -->|unsafe| F[Escalate to human]
-    E -->|safe| G[Retrieve corpus docs]
-    G -->|BM25 ambiguous| G2[LLM Routing Fallback]
+    A[support_tickets.csv] --> B[Parse all ticket JSONs]
+    B --> C["Batch Classify all tickets\n(single LLM call → SIMPLE / COMPLEX)"]
+    C --> D["Create asyncio.Task per ticket\n(Semaphore: max 10 concurrent)"]
+    D --> E[Safety & Injection Check]
+    E -->|"injection / exfiltration"| F[Escalate → security dept]
+    E -->|"critical / high risk"| F2[Escalate → specialist dept]
+    E -->|safe| G[BM25 Retrieval]
+    G -->|"low confidence score"| G2["LLM Company Routing Fallback\n(llama-3.3-70b-versatile)"]
     G2 --> G
-    G --> H[Async LLM Generation]
-    H --> I[Validate Output Guardrails]
-    I -->|invalid/rate-limit| I2[Deterministic Fallback]
-    I -->|valid| J[Collect Results]
-    I2 --> J
-    J --> K[Sort by original index]
+    G -->|"COMPLEX + snippets found"| H["Async LLM Response\n(llama-3.3-70b-versatile)"]
+    H -->|"429 / rate limit → retry x3"| H
+    H -->|"still failing"| HF["Fallback Model\n(llama-3.1-8b-instant)"]
+    H -->|"output guardrail fail"| HD[Deterministic Response]
+    HF -->|"guardrail fail"| HD
+    G -->|SIMPLE| HD
+    HD --> J[Collect Result with original idx]
+    H -->|valid| J
+    HF -->|valid| J
+    F --> J
+    F2 --> J
+    J --> K[Sort by original row index]
     K --> L[Write output.csv]
 ```
 
@@ -58,10 +65,11 @@ The top retrieved document(s) are converted into an excerpt. If BM25 yields high
 To meet the strict 3-minute evaluation execution limit for the 150-ticket hidden set, the pipeline uses `asyncio` to process tickets concurrently rather than sequentially. This eliminates network I/O bottlenecks.
 
 When a ticket is safe to answer and classified as `COMPLEX`, the pipeline generates a response using a fast LLM provider (Groq) via `AsyncGroq`. Because free-tier APIs have strict rate limits (e.g., 30 RPM), the asynchronous generation is protected by:
-- An `asyncio.Semaphore` capping concurrent requests (max 20).
-- An exponential backoff retry loop handling HTTP 429 (Rate Limit) transient errors.
+- An `asyncio.Semaphore` capping concurrent requests (max **10**).
+- An exponential backoff retry loop handling HTTP 429 (Rate Limit) transient errors (up to 3 attempts).
+- Automatic **model fallback**: if `llama-3.3-70b-versatile` exhausts all retries due to daily/TPM quota, the pipeline seamlessly retries using `llama-3.1-8b-instant` (higher free-tier limits) before giving up entirely.
 
-If the LLM is unavailable, rate-limited beyond retries, or fails output validation, the system gracefully falls back to a deterministic string concatenation of the snippets.
+If all LLM paths fail or the output fails guardrail validation, the system gracefully falls back to a deterministic string concatenation of the retrieved snippets.
 
 ## Safety and Adversarial Handling
 
