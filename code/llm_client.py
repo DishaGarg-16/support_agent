@@ -33,7 +33,7 @@ _client: Optional["AsyncGroq"] = None
 _initialised = False
 
 MODEL = "llama-3.3-70b-versatile"
-FALLBACK_MODEL = "llama3-8b-8192"  # Higher free-tier rate limits — used when primary hits daily/TPM cap
+FALLBACK_MODEL = "llama-3.1-8b-instant"  # Higher free-tier rate limits — used when primary hits daily/TPM cap
 TEMPERATURE = 0.3
 SEED = 42
 MAX_TOKENS = 512
