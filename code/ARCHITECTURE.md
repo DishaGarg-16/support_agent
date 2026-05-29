@@ -2,30 +2,35 @@
 
 ## High-Level Architecture
 
-The agent is a hybrid deterministic and LLM-powered support triage pipeline with four main stages:
+The agent is a hybrid deterministic and LLM-powered support triage pipeline with five main stages:
 
 1. **Input parsing and safety screening (Deterministic)**
-2. **Routing and retrieval (Deterministic with LLM fallback)**
-3. **Response generation (LLM-powered with deterministic fallback)**
-4. **Output assembly and validation (Deterministic)**
+2. **Batch Classification (LLM-powered)**
+3. **Routing and retrieval (Deterministic with LLM fallback)**
+4. **Concurrent Response generation (Async LLM with deterministic fallback)**
+5. **Output assembly and validation (Deterministic)**
 
-The pipeline reads each ticket row, parses the JSON conversation history, classifies the request, and decides whether it is safe to answer directly or should be escalated. It primarily uses local rule-based safety checks for maximum speed and security, but offloads response generation to an LLM (Groq) to provide natural, human-sounding answers.
+The pipeline uses a two-pass architecture. First, it parses all tickets and runs a single batch LLM call to classify their complexity. Then, it uses `asyncio` to process the tickets concurrently. It primarily uses local rule-based safety checks for maximum speed and security, but offloads response generation to an LLM (Groq) to provide natural, human-sounding answers for complex tickets. Concurrency is strictly rate-limited using a semaphore to stay within free-tier API limits.
 
 ## Data Flow
 
 ```mermaid
 flowchart TD
-    A[CSV row] --> B[Parse issue JSON]
-    B --> C[Safety checks]
-    C -->|unsafe| D[Escalate to human]
-    C -->|safe| E[Retrieve corpus docs]
-    E -->|BM25 ambiguous| E2[LLM Routing Fallback]
-    E2 --> E
-    E --> F[LLM Generate Response]
-    F --> G[Validate LLM Output Guardrails]
-    G -->|invalid| G2[Deterministic Fallback]
-    G -->|valid| H[Write output.csv]
-    G2 --> H
+    A[CSV Tickets] --> B[Parse all JSONs]
+    B --> C[Batch Classify Complexity]
+    C --> D[Async Concurrent Processing]
+    D --> E[Safety checks]
+    E -->|unsafe| F[Escalate to human]
+    E -->|safe| G[Retrieve corpus docs]
+    G -->|BM25 ambiguous| G2[LLM Routing Fallback]
+    G2 --> G
+    G --> H[Async LLM Generation]
+    H --> I[Validate Output Guardrails]
+    I -->|invalid/rate-limit| I2[Deterministic Fallback]
+    I -->|valid| J[Collect Results]
+    I2 --> J
+    J --> K[Sort by original index]
+    K --> L[Write output.csv]
 ```
 
 ## Retrieval Strategy
@@ -48,9 +53,15 @@ Retrieval uses:
 
 The top retrieved document(s) are converted into an excerpt. If BM25 yields highly uncertain or tied results, the pipeline uses a lightweight LLM fallback to disambiguate the company and product area before retrying retrieval. The final snippets serve as the factual basis for the response.
 
-## Response Generation
+## Response Generation and Concurrency
 
-When a ticket is safe to answer, the pipeline generates a response using a fast LLM provider (Groq). The LLM is strictly prompted to use ONLY the retrieved BM25 snippets (RAG) and maintain a professional tone without hallucinating. If the LLM is unavailable or fails output validation, the system gracefully falls back to a deterministic string concatenation of the snippets.
+To meet the strict 3-minute evaluation execution limit for the 150-ticket hidden set, the pipeline uses `asyncio` to process tickets concurrently rather than sequentially. This eliminates network I/O bottlenecks.
+
+When a ticket is safe to answer and classified as `COMPLEX`, the pipeline generates a response using a fast LLM provider (Groq) via `AsyncGroq`. Because free-tier APIs have strict rate limits (e.g., 30 RPM), the asynchronous generation is protected by:
+- An `asyncio.Semaphore` capping concurrent requests (max 20).
+- An exponential backoff retry loop handling HTTP 429 (Rate Limit) transient errors.
+
+If the LLM is unavailable, rate-limited beyond retries, or fails output validation, the system gracefully falls back to a deterministic string concatenation of the snippets.
 
 ## Safety and Adversarial Handling
 
