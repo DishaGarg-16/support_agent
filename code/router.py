@@ -26,7 +26,7 @@ If unsure, pick the most likely one.
 """
 
 
-def _llm_route_fallback(facts: TicketFacts) -> str | None:
+async def _llm_route_fallback(facts: TicketFacts) -> str | None:
     """Ask the LLM to classify the company when BM25 is uncertain."""
     if not llm_client.is_available():
         return None
@@ -35,7 +35,7 @@ def _llm_route_fallback(facts: TicketFacts) -> str | None:
         f"Company field: {facts.company_field}\n"
         f"Content: {facts.user_text[:500]}"
     )
-    raw = llm_client.generate(
+    raw = await llm_client.generate(
         _ROUTE_SYSTEM_PROMPT,
         user_msg,
         temperature=0.0,
@@ -65,7 +65,7 @@ def find_doc(corpus: CorpusIndex, path: str) -> CorpusDoc | None:
     return None
 
 
-def route_and_retrieve(
+async def route_and_retrieve(
     corpus: CorpusIndex,
     facts: TicketFacts,
     company_hint: str,
@@ -97,7 +97,7 @@ def route_and_retrieve(
     # If BM25 returned nothing or very low confidence, ask the LLM to help
     # disambiguate the company/product area so we can retry with a better hint.
     if not docs or docs[0][0] < 2.0:
-        llm_hint = _llm_route_fallback(facts)
+        llm_hint = await _llm_route_fallback(facts)
         if llm_hint and llm_hint != company_filter:
             retry_query = build_retrieval_query(facts, llm_hint)
             retry_docs = corpus.search(retry_query, company_hint=llm_hint, top_k=5)

@@ -34,7 +34,7 @@ RULES — follow these exactly:
 """
 
 
-def answer_from_snippets(facts: TicketFacts, snippets: list[str], product_area: str, *, use_llm: bool = False) -> str:
+async def answer_from_snippets(facts: TicketFacts, snippets: list[str], product_area: str, *, use_llm: bool = False) -> str:
     """Generate a support response — LLM-powered for complex tickets, deterministic for simple ones."""
     if not snippets:
         return scope_response(facts)
@@ -47,7 +47,7 @@ def answer_from_snippets(facts: TicketFacts, snippets: list[str], product_area: 
 
     # LLM path — only for tickets classified as COMPLEX
     if use_llm:
-        llm_answer = _llm_generate(facts, cleaned, product_area)
+        llm_answer = await _llm_generate(facts, cleaned, product_area)
         if llm_answer:
             return llm_answer
 
@@ -55,7 +55,7 @@ def answer_from_snippets(facts: TicketFacts, snippets: list[str], product_area: 
     return _deterministic_answer(cleaned, product_area)
 
 
-def _llm_generate(facts: TicketFacts, cleaned_snippets: list[str], product_area: str) -> str | None:
+async def _llm_generate(facts: TicketFacts, cleaned_snippets: list[str], product_area: str) -> str | None:
     """Try to generate a response via the LLM. Returns None on failure."""
     if not llm_client.is_available():
         return None
@@ -69,7 +69,7 @@ def _llm_generate(facts: TicketFacts, cleaned_snippets: list[str], product_area:
         f"CONTEXT SNIPPETS:\n{context_block}"
     )
 
-    raw = llm_client.generate(RESPONSE_SYSTEM_PROMPT, user_message)
+    raw = await llm_client.generate(RESPONSE_SYSTEM_PROMPT, user_message)
     if raw and llm_client.validate_llm_response(raw):
         return raw
     return None

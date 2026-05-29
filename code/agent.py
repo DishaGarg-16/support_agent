@@ -1,7 +1,13 @@
-"""Hybrid support triage agent — deterministic core with selective LLM."""
+"""Hybrid support triage agent — deterministic core with selective LLM.
+
+Uses asyncio to process tickets concurrently, dramatically reducing wall-clock
+time for LLM-bound tickets while respecting API rate limits via the semaphore
+in llm_client.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 from pathlib import Path
@@ -44,30 +50,48 @@ class SupportTriageAgent:
         self.llm_count = 0
         self.deterministic_count = 0
 
-    def process_csv(self, input_path: Path, output_path: Path):
-        """Two-pass pipeline: parse + classify, then generate responses."""
+    async def process_csv(self, input_path: Path, output_path: Path):
+        """Two-pass async pipeline: parse + classify, then generate responses concurrently."""
         rows = self._read_input_rows(input_path)
         total = len(rows)
 
-        # --- Pass 1: Parse all tickets ---
+        # --- Pass 1: Parse all tickets (CPU-only, fast) ---
         all_facts: list[TicketFacts] = []
         for row in rows:
             all_facts.append(extract_facts(row))
 
-        # --- Batch classify ---
-        complexity_map = batch_classify(all_facts)
+        # --- Batch classify (single async LLM call) ---
+        complexity_map = await batch_classify(all_facts)
 
-        # --- Pass 2: Process each ticket with classification ---
-        results: list[dict[str, str]] = []
+        # --- Pass 2: Process each ticket concurrently ---
+        # Create a task per ticket, tagging each with its original index
+        async def _process_one(idx: int, row: dict, facts: TicketFacts, use_llm: bool):
+            result = await self.triage_row(row, facts, use_llm=use_llm)
+            return idx, result, use_llm
+
+        tasks = []
         for i, (row, facts) in enumerate(zip(rows, all_facts)):
             use_llm = complexity_map.get(i, "SIMPLE") == "COMPLEX"
-            result = self.triage_row(row, facts, use_llm=use_llm)
-            results.append(result)
-            yield i + 1, total, self.llm_count, self.deterministic_count
+            tasks.append(asyncio.create_task(_process_one(i, row, facts, use_llm)))
 
-        self._write_output_rows(results, output_path)
+        # Collect results as they complete, yielding progress
+        results: dict[int, dict[str, str]] = {}
+        completed = 0
+        for coro in asyncio.as_completed(tasks):
+            idx, result, used_llm = await coro
+            results[idx] = result
+            if used_llm:
+                self.llm_count += 1
+            else:
+                self.deterministic_count += 1
+            completed += 1
+            yield completed, total, self.llm_count, self.deterministic_count
 
-    def triage_row(
+        # Write output in original row order
+        ordered_results = [results[i] for i in range(total)]
+        self._write_output_rows(ordered_results, output_path)
+
+    async def triage_row(
         self,
         row: dict[str, str],
         facts: TicketFacts,
@@ -81,7 +105,7 @@ class SupportTriageAgent:
         requires_verification = needs_verification(facts, request_type, text)
         high_risk_escalation = should_escalate_high_risk(facts, request_type, text)
 
-        product_area, source_docs, retrieved_snippets = route_and_retrieve(
+        product_area, source_docs, retrieved_snippets = await route_and_retrieve(
             self.corpus,
             facts,
             company_hint,
@@ -92,7 +116,7 @@ class SupportTriageAgent:
             or facts.pure_injection,
         )
 
-        status, actions_taken, response = self._decide_status_and_response(
+        status, actions_taken, response = await self._decide_status_and_response(
             facts=facts,
             request_type=request_type,
             risk_level=risk_level,
@@ -185,7 +209,7 @@ class SupportTriageAgent:
             "actions_taken": json.dumps(result.actions_taken, ensure_ascii=False, separators=(",", ":")),
         }
 
-    def _decide_status_and_response(
+    async def _decide_status_and_response(
         self,
         *,
         facts: TicketFacts,
@@ -210,7 +234,6 @@ class SupportTriageAgent:
                     summary="Potential prompt injection or request to reveal internal instructions/corpus content.",
                 )
             )
-            self.deterministic_count += 1
             return "escalated", actions, scope_response(facts)
 
         if risk_level in {"critical", "high"} and high_risk_escalation:
@@ -221,19 +244,16 @@ class SupportTriageAgent:
                     summary=escalation_summary(text, company, risk_level),
                 )
             )
-            self.deterministic_count += 1
             return "escalated", actions, escalation_response(facts, risk_level, company)
 
         if requires_verification:
             verify_action = verification_action(facts)
             if verify_action:
                 actions.append(verify_action)
-            self.deterministic_count += 1
             return "replied", actions, verification_response(facts, request_type)
 
         if not source_docs:
             if request_type == "invalid":
-                self.deterministic_count += 1
                 return "replied", actions, scope_response(facts)
             actions.append(
                 escalate_action(
@@ -242,15 +262,9 @@ class SupportTriageAgent:
                     summary="No matching corpus article was found for this support request.",
                 )
             )
-            self.deterministic_count += 1
             return "escalated", actions, escalation_response(facts, risk_level, company)
 
         # This is the only path where LLM usage matters
-        response = answer_from_snippets(facts, retrieved_snippets, product_area, use_llm=use_llm)
-        if use_llm:
-            self.llm_count += 1
-        else:
-            self.deterministic_count += 1
+        response = await answer_from_snippets(facts, retrieved_snippets, product_area, use_llm=use_llm)
         actions.extend(maybe_action_from_request(facts, request_type, text))
         return "replied", actions, response
-

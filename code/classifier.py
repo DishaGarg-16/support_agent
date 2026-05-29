@@ -49,7 +49,7 @@ No explanations, no extra text.
 """
 
 
-def batch_classify(
+async def batch_classify(
     all_facts: list[TicketFacts],
 ) -> dict[int, str]:
     """Classify all tickets in a single LLM call.
@@ -74,7 +74,7 @@ def batch_classify(
 
     user_message = "Tickets:\n" + "\n".join(lines)
 
-    raw = llm_client.generate(
+    raw = await llm_client.generate(
         _CLASSIFY_SYSTEM_PROMPT,
         user_message,
         temperature=0.0,

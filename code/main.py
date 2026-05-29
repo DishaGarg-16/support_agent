@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import time
 from pathlib import Path
@@ -30,7 +31,7 @@ def print_banner() -> None:
     console.print(panel)
     console.print()
 
-def main() -> int:
+async def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
     input_path = repo_root / "support_tickets" / "support_tickets.csv"
     output_path = repo_root / "support_tickets" / "output.csv"
@@ -48,6 +49,7 @@ def main() -> int:
     # Show LLM mode status
     if llm_client.is_available():
         console.print(f"[bold green]*[/bold green] LLM mode: [green]Active[/green] (Groq / {llm_client.MODEL})")
+        console.print(f"[bold green]*[/bold green] Processing: [green]Async[/green] (concurrent tickets)")
     else:
         console.print("[bold yellow]*[/bold yellow] LLM mode: [yellow]Disabled[/yellow] (deterministic fallback)")
 
@@ -72,7 +74,7 @@ def main() -> int:
     ) as progress:
         task = progress.add_task("[green]Processing tickets...", total=None)
 
-        for processed, total, llm_count, det_count in agent.process_csv(input_path, output_path):
+        async for processed, total, llm_count, det_count in agent.process_csv(input_path, output_path):
             if progress.tasks[task].total is None:
                 progress.update(task, total=total)
                 total_tickets = total
@@ -95,6 +97,7 @@ def main() -> int:
     if total_tickets > 0:
         table.add_row("Average Latency", f"{(elapsed / total_tickets):.2f}s / ticket")
     table.add_row("LLM Mode", "Active" if llm_client.is_available() else "Disabled")
+    table.add_row("Processing", "Async" if llm_client.is_available() else "Sequential")
     table.add_row("LLM Responses", str(llm_used))
     table.add_row("Deterministic Responses", str(det_used))
 
@@ -103,4 +106,4 @@ def main() -> int:
     return 0
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(asyncio.run(main()))

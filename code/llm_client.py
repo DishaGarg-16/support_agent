@@ -1,12 +1,16 @@
-"""Thin wrapper around the Groq SDK for LLM-powered response generation.
+"""Async wrapper around the Groq SDK for LLM-powered response generation.
 
-Provides a single `generate()` function. If the API key is missing or the
-call fails for any reason, every function returns None so the caller can
+Provides a single async `generate()` function. If the API key is missing or
+the call fails for any reason, every function returns None so the caller can
 fall back to the deterministic path with zero downtime.
+
+Rate-limiting: an asyncio.Semaphore caps concurrent in-flight requests to
+avoid hitting Groq's free-tier RPM limit.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import logging
@@ -18,14 +22,14 @@ logger = logging.getLogger(__name__)
 # SDK import — optional so the rest of the pipeline works without it
 # ---------------------------------------------------------------------------
 try:
-    from groq import Groq
+    from groq import AsyncGroq
 except ImportError:
-    Groq = None  # type: ignore[assignment,misc]
+    AsyncGroq = None  # type: ignore[assignment,misc]
 
 # ---------------------------------------------------------------------------
 # Module-level client (lazy singleton)
 # ---------------------------------------------------------------------------
-_client: Optional["Groq"] = None
+_client: Optional["AsyncGroq"] = None
 _initialised = False
 
 MODEL = "llama-3.3-70b-versatile"
@@ -33,14 +37,30 @@ TEMPERATURE = 0.3
 SEED = 42
 MAX_TOKENS = 512
 
+# Rate-limit guard — max concurrent LLM requests
+_MAX_CONCURRENT = 20
+_semaphore: Optional[asyncio.Semaphore] = None
 
-def _get_client() -> Optional["Groq"]:
-    """Return a Groq client if a key is available, else None."""
+# Retry config for 429 / transient errors
+_MAX_RETRIES = 3
+_BASE_BACKOFF = 1.0  # seconds
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Return (and lazily create) the per-event-loop semaphore."""
+    global _semaphore
+    if _semaphore is None:
+        _semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+    return _semaphore
+
+
+def _get_client() -> Optional["AsyncGroq"]:
+    """Return an AsyncGroq client if a key is available, else None."""
     global _client, _initialised
     if _initialised:
         return _client
     _initialised = True
-    if Groq is None:
+    if AsyncGroq is None:
         logger.info("groq SDK not installed — LLM features disabled")
         return None
     key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -48,9 +68,9 @@ def _get_client() -> Optional["Groq"]:
         logger.info("GROQ_API_KEY not set — LLM features disabled, using deterministic fallback")
         return None
     try:
-        _client = Groq(api_key=key)
+        _client = AsyncGroq(api_key=key)
     except Exception as exc:
-        logger.warning("Failed to initialise Groq client: %s", exc)
+        logger.warning("Failed to initialise AsyncGroq client: %s", exc)
         _client = None
     return _client
 
@@ -60,33 +80,53 @@ def is_available() -> bool:
     return _get_client() is not None
 
 
-def generate(
+async def generate(
     system_prompt: str,
     user_message: str,
     *,
     temperature: float = TEMPERATURE,
     max_tokens: int = MAX_TOKENS,
 ) -> Optional[str]:
-    """Call the LLM and return the assistant message, or None on failure."""
+    """Call the LLM and return the assistant message, or None on failure.
+
+    Respects the concurrency semaphore and retries on transient / rate-limit
+    errors with exponential backoff.
+    """
     client = _get_client()
     if client is None:
         return None
-    try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            seed=SEED,
-        )
-        text = response.choices[0].message.content
-        return text.strip() if text else None
-    except Exception as exc:
-        logger.warning("Groq API call failed: %s", exc)
-        return None
+
+    sem = _get_semaphore()
+
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            async with sem:
+                response = await client.chat.completions.create(
+                    model=MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    seed=SEED,
+                )
+            text = response.choices[0].message.content
+            return text.strip() if text else None
+        except Exception as exc:
+            exc_str = str(exc).lower()
+            is_retryable = "429" in exc_str or "rate" in exc_str or "timeout" in exc_str
+            if is_retryable and attempt < _MAX_RETRIES:
+                wait = _BASE_BACKOFF * (2 ** (attempt - 1))
+                logger.warning(
+                    "Groq API retryable error (attempt %d/%d): %s — retrying in %.1fs",
+                    attempt, _MAX_RETRIES, exc, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.warning("Groq API call failed (attempt %d/%d): %s", attempt, _MAX_RETRIES, exc)
+                return None
+    return None
 
 
 # ---------------------------------------------------------------------------
