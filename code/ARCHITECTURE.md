@@ -2,14 +2,14 @@
 
 ## High-Level Architecture
 
-The agent is a deterministic, local-first support triage pipeline with four main stages:
+The agent is a hybrid deterministic and LLM-powered support triage pipeline with four main stages:
 
-1. **Input parsing and safety screening**
-2. **Routing and retrieval**
-3. **Response generation with guardrails**
-4. **Output assembly and validation**
+1. **Input parsing and safety screening (Deterministic)**
+2. **Routing and retrieval (Deterministic with LLM fallback)**
+3. **Response generation (LLM-powered with deterministic fallback)**
+4. **Output assembly and validation (Deterministic)**
 
-The pipeline reads each ticket row, parses the JSON conversation history, classifies the request, and decides whether it is safe to answer directly or should be escalated.
+The pipeline reads each ticket row, parses the JSON conversation history, classifies the request, and decides whether it is safe to answer directly or should be escalated. It primarily uses local rule-based safety checks for maximum speed and security, but offloads response generation to an LLM (Groq) to provide natural, human-sounding answers.
 
 ## Data Flow
 
@@ -19,9 +19,13 @@ flowchart TD
     B --> C[Safety checks]
     C -->|unsafe| D[Escalate to human]
     C -->|safe| E[Retrieve corpus docs]
-    E --> F[Build grounded response]
-    F --> G[Output guardrails]
-    G --> H[Write output.csv]
+    E -->|BM25 ambiguous| E2[LLM Routing Fallback]
+    E2 --> E
+    E --> F[LLM Generate Response]
+    F --> G[Validate LLM Output Guardrails]
+    G -->|invalid| G2[Deterministic Fallback]
+    G -->|valid| H[Write output.csv]
+    G2 --> H
 ```
 
 ## Retrieval Strategy
@@ -42,7 +46,11 @@ Retrieval uses:
 - inferred company hints
 - simple company boosts for the relevant corpus subtree
 
-The top retrieved document(s) are converted into an excerpt and used as the factual basis for the response.
+The top retrieved document(s) are converted into an excerpt. If BM25 yields highly uncertain or tied results, the pipeline uses a lightweight LLM fallback to disambiguate the company and product area before retrying retrieval. The final snippets serve as the factual basis for the response.
+
+## Response Generation
+
+When a ticket is safe to answer, the pipeline generates a response using a fast LLM provider (Groq). The LLM is strictly prompted to use ONLY the retrieved BM25 snippets (RAG) and maintain a professional tone without hallucinating. If the LLM is unavailable or fails output validation, the system gracefully falls back to a deterministic string concatenation of the snippets.
 
 ## Safety and Adversarial Handling
 
@@ -116,5 +124,5 @@ Before writing the final row, the agent enforces:
 
 ### 4. Known failure mode not fully fixed
 
-The current response generator is conservative and may produce excerpts that are too literal or too short for some complex tickets. A more advanced summarizer or a better section selector would improve completeness.
+While the LLM generation handles nuance well, extremely long tickets might exceed context limits or cause the BM25 retriever to pull the wrong snippets, leading the LLM to state it does not have enough information.
 
