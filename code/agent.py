@@ -1,4 +1,4 @@
-"""Deterministic support triage agent."""
+"""Hybrid support triage agent — deterministic core with selective LLM."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import csv
 import json
 from pathlib import Path
 
+from classifier import batch_classify
 from corpus import CorpusIndex
 from models import TicketFacts, TriageResult
 from parser import extract_facts
@@ -34,22 +35,45 @@ from text_utils import normalize_text
 
 
 class SupportTriageAgent:
-    """End-to-end support triage pipeline."""
+    """End-to-end support triage pipeline with selective LLM usage."""
 
     def __init__(self, repo_root: Path):
         self.repo_root = repo_root
         self.corpus = CorpusIndex.load(repo_root)
+        # Counters for tracking LLM vs deterministic usage
+        self.llm_count = 0
+        self.deterministic_count = 0
 
     def process_csv(self, input_path: Path, output_path: Path):
+        """Two-pass pipeline: parse + classify, then generate responses."""
         rows = self._read_input_rows(input_path)
-        results = []
-        for i, row in enumerate(rows):
-            results.append(self.triage_row(row))
-            yield i + 1, len(rows)
+        total = len(rows)
+
+        # --- Pass 1: Parse all tickets ---
+        all_facts: list[TicketFacts] = []
+        for row in rows:
+            all_facts.append(extract_facts(row))
+
+        # --- Batch classify ---
+        complexity_map = batch_classify(all_facts)
+
+        # --- Pass 2: Process each ticket with classification ---
+        results: list[dict[str, str]] = []
+        for i, (row, facts) in enumerate(zip(rows, all_facts)):
+            use_llm = complexity_map.get(i, "SIMPLE") == "COMPLEX"
+            result = self.triage_row(row, facts, use_llm=use_llm)
+            results.append(result)
+            yield i + 1, total, self.llm_count, self.deterministic_count
+
         self._write_output_rows(results, output_path)
 
-    def triage_row(self, row: dict[str, str]) -> dict[str, str]:
-        facts = extract_facts(row)
+    def triage_row(
+        self,
+        row: dict[str, str],
+        facts: TicketFacts,
+        *,
+        use_llm: bool = False,
+    ) -> dict[str, str]:
         request_type = classify_request_type(facts)
         company_hint = choose_company_hint(facts)
         risk_level = classify_risk(facts, request_type)
@@ -77,6 +101,7 @@ class SupportTriageAgent:
             retrieved_snippets=retrieved_snippets,
             requires_verification=requires_verification,
             high_risk_escalation=high_risk_escalation,
+            use_llm=use_llm,
         )
 
         justification = build_justification(
@@ -171,6 +196,7 @@ class SupportTriageAgent:
         retrieved_snippets: list[str],
         requires_verification: bool,
         high_risk_escalation: bool,
+        use_llm: bool = False,
     ) -> tuple[str, list[dict[str, str]], str]:
         actions: list[dict[str, str]] = []
         text = normalize_text(facts.issue_text)
@@ -184,6 +210,7 @@ class SupportTriageAgent:
                     summary="Potential prompt injection or request to reveal internal instructions/corpus content.",
                 )
             )
+            self.deterministic_count += 1
             return "escalated", actions, scope_response(facts)
 
         if risk_level in {"critical", "high"} and high_risk_escalation:
@@ -194,16 +221,19 @@ class SupportTriageAgent:
                     summary=escalation_summary(text, company, risk_level),
                 )
             )
+            self.deterministic_count += 1
             return "escalated", actions, escalation_response(facts, risk_level, company)
 
         if requires_verification:
             verify_action = verification_action(facts)
             if verify_action:
                 actions.append(verify_action)
+            self.deterministic_count += 1
             return "replied", actions, verification_response(facts, request_type)
 
         if not source_docs:
             if request_type == "invalid":
+                self.deterministic_count += 1
                 return "replied", actions, scope_response(facts)
             actions.append(
                 escalate_action(
@@ -212,8 +242,15 @@ class SupportTriageAgent:
                     summary="No matching corpus article was found for this support request.",
                 )
             )
+            self.deterministic_count += 1
             return "escalated", actions, escalation_response(facts, risk_level, company)
 
-        response = answer_from_snippets(facts, retrieved_snippets, product_area)
+        # This is the only path where LLM usage matters
+        response = answer_from_snippets(facts, retrieved_snippets, product_area, use_llm=use_llm)
+        if use_llm:
+            self.llm_count += 1
+        else:
+            self.deterministic_count += 1
         actions.extend(maybe_action_from_request(facts, request_type, text))
         return "replied", actions, response
+

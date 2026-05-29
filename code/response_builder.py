@@ -34,8 +34,8 @@ RULES — follow these exactly:
 """
 
 
-def answer_from_snippets(facts: TicketFacts, snippets: list[str], product_area: str) -> str:
-    """Generate a support response — LLM-powered with deterministic fallback."""
+def answer_from_snippets(facts: TicketFacts, snippets: list[str], product_area: str, *, use_llm: bool = False) -> str:
+    """Generate a support response — LLM-powered for complex tickets, deterministic for simple ones."""
     if not snippets:
         return scope_response(facts)
 
@@ -45,10 +45,11 @@ def answer_from_snippets(facts: TicketFacts, snippets: list[str], product_area: 
     if not cleaned:
         return scope_response(facts)
 
-    # Attempt LLM generation
-    llm_answer = _llm_generate(facts, cleaned, product_area)
-    if llm_answer:
-        return llm_answer
+    # LLM path — only for tickets classified as COMPLEX
+    if use_llm:
+        llm_answer = _llm_generate(facts, cleaned, product_area)
+        if llm_answer:
+            return llm_answer
 
     # Deterministic fallback
     return _deterministic_answer(cleaned, product_area)

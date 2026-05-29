@@ -52,8 +52,14 @@ def main() -> int:
         console.print("[bold yellow]*[/bold yellow] LLM mode: [yellow]Disabled[/yellow] (deterministic fallback)")
 
     console.print(f"[bold cyan]*[/bold cyan] Reading tickets from [yellow]{input_path.relative_to(repo_root).as_posix()}[/yellow]")
-    
+
+    # Batch classification happens inside process_csv (Pass 1)
+    if llm_client.is_available():
+        console.print("[bold cyan]*[/bold cyan] Classifying ticket complexity (single batch LLM call)...")
+
     total_tickets = 0
+    llm_used = 0
+    det_used = 0
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -65,12 +71,14 @@ def main() -> int:
         console=console,
     ) as progress:
         task = progress.add_task("[green]Processing tickets...", total=None)
-        
-        for processed, total in agent.process_csv(input_path, output_path):
+
+        for processed, total, llm_count, det_count in agent.process_csv(input_path, output_path):
             if progress.tasks[task].total is None:
                 progress.update(task, total=total)
                 total_tickets = total
             progress.update(task, completed=processed)
+            llm_used = llm_count
+            det_used = det_count
 
     elapsed = time.perf_counter() - start
 
@@ -79,7 +87,7 @@ def main() -> int:
 
     # Summary table
     table = Table(title="[bold]Execution Summary[/bold]", show_header=True, header_style="bold magenta")
-    table.add_column("Metric", style="dim", width=20)
+    table.add_column("Metric", style="dim", width=24)
     table.add_column("Value", justify="right")
 
     table.add_row("Total Tickets", str(total_tickets))
@@ -87,6 +95,8 @@ def main() -> int:
     if total_tickets > 0:
         table.add_row("Average Latency", f"{(elapsed / total_tickets):.2f}s / ticket")
     table.add_row("LLM Mode", "Active" if llm_client.is_available() else "Disabled")
+    table.add_row("LLM Responses", str(llm_used))
+    table.add_row("Deterministic Responses", str(det_used))
 
     console.print(table)
     console.print()
