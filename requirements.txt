@@ -1,2 +1,4 @@
 rich
 pyfiglet
+groq
+python-dotenv

@@ -6,6 +6,7 @@ import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
 from pyfiglet import Figlet
 from rich.console import Console
 from rich.panel import Panel
@@ -13,6 +14,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeEl
 from rich.table import Table
 
 from agent import SupportTriageAgent
+import llm_client
 
 console = Console()
 
@@ -35,10 +37,19 @@ def main() -> int:
 
     print_banner()
 
+    # Load environment variables (.env)
+    load_dotenv(repo_root / ".env")
+
     start = time.perf_counter()
 
     with console.status("[bold green]Initializing Support Triage Agent...", spinner="dots"):
         agent = SupportTriageAgent(repo_root)
+
+    # Show LLM mode status
+    if llm_client.is_available():
+        console.print(f"[bold green]*[/bold green] LLM mode: [green]Active[/green] (Groq / {llm_client.MODEL})")
+    else:
+        console.print("[bold yellow]*[/bold yellow] LLM mode: [yellow]Disabled[/yellow] (deterministic fallback)")
 
     console.print(f"[bold cyan]*[/bold cyan] Reading tickets from [yellow]{input_path.relative_to(repo_root).as_posix()}[/yellow]")
     
@@ -75,6 +86,7 @@ def main() -> int:
     table.add_row("Elapsed Time", f"{elapsed:.2f}s")
     if total_tickets > 0:
         table.add_row("Average Latency", f"{(elapsed / total_tickets):.2f}s / ticket")
+    table.add_row("LLM Mode", "Active" if llm_client.is_available() else "Disabled")
 
     console.print(table)
     console.print()

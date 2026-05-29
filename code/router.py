@@ -5,8 +5,48 @@ from __future__ import annotations
 from pathlib import Path
 
 from corpus import CorpusDoc, CorpusIndex, extract_answer_excerpt
+import llm_client
 from models import TicketFacts
 from text_utils import normalize_text
+
+
+# ---------------------------------------------------------------------------
+# LLM routing prompt — used only for ambiguous edge cases
+# ---------------------------------------------------------------------------
+_ROUTE_SYSTEM_PROMPT = """\
+You are a support ticket classifier. Given a support ticket, determine which 
+company the ticket is about.
+
+Respond with EXACTLY ONE of these words and nothing else:
+- devplatform
+- claude
+- visa
+
+If unsure, pick the most likely one.
+"""
+
+
+def _llm_route_fallback(facts: TicketFacts) -> str | None:
+    """Ask the LLM to classify the company when BM25 is uncertain."""
+    if not llm_client.is_available():
+        return None
+    user_msg = (
+        f"Subject: {facts.subject}\n"
+        f"Company field: {facts.company_field}\n"
+        f"Content: {facts.user_text[:500]}"
+    )
+    raw = llm_client.generate(
+        _ROUTE_SYSTEM_PROMPT,
+        user_msg,
+        temperature=0.0,
+        max_tokens=10,
+    )
+    if not raw:
+        return None
+    answer = raw.strip().lower().split()[0] if raw.strip() else None
+    if answer in {"devplatform", "claude", "visa"}:
+        return answer
+    return None
 
 
 def choose_company_hint(facts: TicketFacts) -> str:
@@ -52,6 +92,18 @@ def route_and_retrieve(
     docs = corpus.search(query, company_hint=company_filter or None, top_k=5)
     if not docs and company_filter:
         docs = corpus.search(query, company_hint=None, top_k=5)
+
+    # --- LLM edge-case routing ---
+    # If BM25 returned nothing or very low confidence, ask the LLM to help
+    # disambiguate the company/product area so we can retry with a better hint.
+    if not docs or docs[0][0] < 2.0:
+        llm_hint = _llm_route_fallback(facts)
+        if llm_hint and llm_hint != company_filter:
+            retry_query = build_retrieval_query(facts, llm_hint)
+            retry_docs = corpus.search(retry_query, company_hint=llm_hint, top_k=5)
+            if retry_docs and (not docs or retry_docs[0][0] > docs[0][0]):
+                docs = retry_docs
+                company_filter = llm_hint
 
     if not docs:
         return "", [], []
@@ -226,4 +278,3 @@ def visa_area(text: str, doc: CorpusDoc | None) -> str:
     if any(term in text for term in ["merchant", "accept", "small business", "interchange", "rules", "regulations", "fraud prevention", "dispute resolution"]):
         return "small_business"
     return "general_support"
-
