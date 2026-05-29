@@ -33,12 +33,13 @@ _client: Optional["AsyncGroq"] = None
 _initialised = False
 
 MODEL = "llama-3.3-70b-versatile"
+FALLBACK_MODEL = "llama3-8b-8192"  # Higher free-tier rate limits — used when primary hits daily/TPM cap
 TEMPERATURE = 0.3
 SEED = 42
 MAX_TOKENS = 512
 
 # Rate-limit guard — max concurrent LLM requests
-_MAX_CONCURRENT = 20
+_MAX_CONCURRENT = 10  # Smaller batches to avoid token spikes
 _semaphore: Optional[asyncio.Semaphore] = None
 
 # Retry config for 429 / transient errors
@@ -90,7 +91,8 @@ async def generate(
     """Call the LLM and return the assistant message, or None on failure.
 
     Respects the concurrency semaphore and retries on transient / rate-limit
-    errors with exponential backoff.
+    errors with exponential backoff. If all retries on the primary model fail
+    due to rate/token limits, automatically falls back to FALLBACK_MODEL.
     """
     client = _get_client()
     if client is None:
@@ -98,34 +100,60 @@ async def generate(
 
     sem = _get_semaphore()
 
-    for attempt in range(1, _MAX_RETRIES + 1):
-        try:
-            async with sem:
-                response = await client.chat.completions.create(
-                    model=MODEL,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message},
-                    ],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    seed=SEED,
-                )
-            text = response.choices[0].message.content
-            return text.strip() if text else None
-        except Exception as exc:
-            exc_str = str(exc).lower()
-            is_retryable = "429" in exc_str or "rate" in exc_str or "timeout" in exc_str
-            if is_retryable and attempt < _MAX_RETRIES:
-                wait = _BASE_BACKOFF * (2 ** (attempt - 1))
-                logger.warning(
-                    "Groq API retryable error (attempt %d/%d): %s — retrying in %.1fs",
-                    attempt, _MAX_RETRIES, exc, wait,
-                )
-                await asyncio.sleep(wait)
-            else:
-                logger.warning("Groq API call failed (attempt %d/%d): %s", attempt, _MAX_RETRIES, exc)
-                return None
+    async def _call(model: str) -> Optional[str]:
+        """Attempt a single call to the given model with retry logic."""
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                async with sem:
+                    response = await client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_message},
+                        ],
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        seed=SEED,
+                    )
+                text = response.choices[0].message.content
+                return text.strip() if text else None
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                is_rate_limit = "429" in exc_str or "rate" in exc_str or "token" in exc_str
+                is_retryable = is_rate_limit or "timeout" in exc_str
+                if is_retryable and attempt < _MAX_RETRIES:
+                    wait = _BASE_BACKOFF * (2 ** (attempt - 1))
+                    logger.warning(
+                        "Groq [%s] retryable error (attempt %d/%d): %s — retrying in %.1fs",
+                        model, attempt, _MAX_RETRIES, exc, wait,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    if is_rate_limit:
+                        logger.warning(
+                            "Groq [%s] rate/token limit exhausted (attempt %d/%d): %s",
+                            model, attempt, _MAX_RETRIES, exc,
+                        )
+                    else:
+                        logger.warning(
+                            "Groq [%s] call failed (attempt %d/%d): %s",
+                            model, attempt, _MAX_RETRIES, exc,
+                        )
+                    return None
+        return None
+
+    # Try primary model first
+    result = await _call(MODEL)
+    if result is not None:
+        return result
+
+    # Primary model failed — try fallback model (higher rate limits)
+    if FALLBACK_MODEL != MODEL:
+        logger.info("Primary model failed — falling back to %s", FALLBACK_MODEL)
+        result = await _call(FALLBACK_MODEL)
+        if result is not None:
+            return result
+
     return None
 
 

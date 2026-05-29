@@ -66,8 +66,8 @@ class SupportTriageAgent:
         # --- Pass 2: Process each ticket concurrently ---
         # Create a task per ticket, tagging each with its original index
         async def _process_one(idx: int, row: dict, facts: TicketFacts, use_llm: bool):
-            result = await self.triage_row(row, facts, use_llm=use_llm)
-            return idx, result, use_llm
+            result, actually_used_llm = await self.triage_row(row, facts, use_llm=use_llm)
+            return idx, result, actually_used_llm
 
         tasks = []
         for i, (row, facts) in enumerate(zip(rows, all_facts)):
@@ -78,9 +78,9 @@ class SupportTriageAgent:
         results: dict[int, dict[str, str]] = {}
         completed = 0
         for coro in asyncio.as_completed(tasks):
-            idx, result, used_llm = await coro
+            idx, result, actually_used_llm = await coro
             results[idx] = result
-            if used_llm:
+            if actually_used_llm:
                 self.llm_count += 1
             else:
                 self.deterministic_count += 1
@@ -116,7 +116,7 @@ class SupportTriageAgent:
             or facts.pure_injection,
         )
 
-        status, actions_taken, response = await self._decide_status_and_response(
+        status, actions_taken, response, actually_used_llm = await self._decide_status_and_response(
             facts=facts,
             request_type=request_type,
             risk_level=risk_level,
@@ -158,7 +158,7 @@ class SupportTriageAgent:
             language=facts.language,
             actions_taken=actions_taken,
         )
-        return self._result_to_row(row, result)
+        return self._result_to_row(row, result), actually_used_llm
 
     def _read_input_rows(self, input_path: Path) -> list[dict[str, str]]:
         with input_path.open(newline="", encoding="utf-8") as f:
@@ -221,7 +221,12 @@ class SupportTriageAgent:
         requires_verification: bool,
         high_risk_escalation: bool,
         use_llm: bool = False,
-    ) -> tuple[str, list[dict[str, str]], str]:
+    ) -> tuple[str, list[dict[str, str]], str, bool]:
+        """Returns (status, actions, response, actually_used_llm).
+        
+        actually_used_llm is True only when a real network call was made
+        to the LLM for response generation. Early-exit paths return False.
+        """
         actions: list[dict[str, str]] = []
         text = normalize_text(facts.issue_text)
         company = facts.company_guess or facts.company_field.lower()
@@ -234,7 +239,7 @@ class SupportTriageAgent:
                     summary="Potential prompt injection or request to reveal internal instructions/corpus content.",
                 )
             )
-            return "escalated", actions, scope_response(facts)
+            return "escalated", actions, scope_response(facts), False
 
         if risk_level in {"critical", "high"} and high_risk_escalation:
             actions.append(
@@ -244,17 +249,17 @@ class SupportTriageAgent:
                     summary=escalation_summary(text, company, risk_level),
                 )
             )
-            return "escalated", actions, escalation_response(facts, risk_level, company)
+            return "escalated", actions, escalation_response(facts, risk_level, company), False
 
         if requires_verification:
             verify_action = verification_action(facts)
             if verify_action:
                 actions.append(verify_action)
-            return "replied", actions, verification_response(facts, request_type)
+            return "replied", actions, verification_response(facts, request_type), False
 
         if not source_docs:
             if request_type == "invalid":
-                return "replied", actions, scope_response(facts)
+                return "replied", actions, scope_response(facts), False
             actions.append(
                 escalate_action(
                     priority="normal",
@@ -262,9 +267,12 @@ class SupportTriageAgent:
                     summary="No matching corpus article was found for this support request.",
                 )
             )
-            return "escalated", actions, escalation_response(facts, risk_level, company)
+            return "escalated", actions, escalation_response(facts, risk_level, company), False
 
-        # This is the only path where LLM usage matters
+        # This is the only path where a real LLM network call may happen
         response = await answer_from_snippets(facts, retrieved_snippets, product_area, use_llm=use_llm)
         actions.extend(maybe_action_from_request(facts, request_type, text))
-        return "replied", actions, response
+        # actually_used_llm is True only when use_llm was requested AND
+        # answer_from_snippets didn't fall back to deterministic (i.e. snippets were present)
+        actually_used_llm = use_llm and bool(retrieved_snippets)
+        return "replied", actions, response, actually_used_llm
