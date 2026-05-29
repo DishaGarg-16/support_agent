@@ -40,9 +40,12 @@ class SupportTriageAgent:
         self.repo_root = repo_root
         self.corpus = CorpusIndex.load(repo_root)
 
-    def process_csv(self, input_path: Path, output_path: Path) -> None:
+    def process_csv(self, input_path: Path, output_path: Path):
         rows = self._read_input_rows(input_path)
-        results = [self.triage_row(row) for row in rows]
+        results = []
+        for i, row in enumerate(rows):
+            results.append(self.triage_row(row))
+            yield i + 1, len(rows)
         self._write_output_rows(results, output_path)
 
     def triage_row(self, row: dict[str, str]) -> dict[str, str]:
