@@ -75,3 +75,26 @@ python code/validate_output.py
 - **Determinism:** Fixed `temperature=0.3` and `seed=42` on all LLM calls. Deterministic paths produce identical outputs on repeated runs.
 - **Corpus-only:** All factual claims in responses are grounded in the `data/` corpus. The LLM is strictly prompted to never hallucinate beyond the retrieved snippets.
 - **No hardcoded secrets:** All credentials are read from environment variables only.
+
+---
+
+## Future Scope
+
+### 1. Recursive Sub-query Resolution
+Currently, if a ticket contains multiple distinct questions, the agent handles it as a single unit and may conservatively escalate or partially answer. A future improvement would **decompose multi-intent tickets into individual sub-queries**, resolve each independently through the full safety → retrieval → generation loop, and merge the answers into a single coherent response. This would be implemented recursively — each sub-query is treated as its own ticket, with results aggregated and citations collected from all relevant documents before final output assembly.
+
+### 2. Multilingual Prompt Injection Defense
+The current injection detection focuses on English-language patterns, leaving a surface for attackers who embed instructions in other languages or mixed-language text. A more robust approach would include:
+- **Language-agnostic intent detection** — running the injection classifier on a machine-translated version of the ticket alongside the original
+- **Unicode homoglyph detection** — catching injections that substitute visually similar characters (e.g., Cyrillic `а` for Latin `a`) to bypass keyword filters
+- **Mixed-language segmentation** — detecting when a ticket begins in one language and embeds malicious instructions in another
+
+### 3. Confidence-Weighted Multi-Document Cross-Referencing
+Instead of trusting the top BM25 document, future versions could cross-reference claims across multiple retrieved documents and automatically flag low-confidence responses when sources contradict each other. This would reduce hallucination risk on corpus conflicts and improve Brier score calibration.
+
+### 4. Adaptive Complexity Threshold
+The SIMPLE/COMPLEX classifier currently uses a fixed prompt with static criteria. A future improvement would dynamically tune the complexity boundary based on observed accuracy — routing more tickets to LLM only when the deterministic path's confidence score falls below a calibrated cutoff, reducing unnecessary API calls further while maintaining response quality.
+
+### 5. Semantic Vector Retrieval (BM25 → Embeddings)
+Replacing or augmenting the BM25 retriever with dense vector embeddings (e.g., `text-embedding-3-small`, `all-MiniLM-L6-v2`) would significantly improve retrieval accuracy for semantically similar but lexically different queries — for example, matching *"my payment didn't go through"* to a corpus document about *"transaction failures"* with no keyword overlap. A hybrid approach — BM25 for speed + vector re-ranking for precision — would offer the best of both worlds. The primary constraint is the strict 3-minute execution limit and the evaluation infrastructure's lack of GPU, making a lightweight ONNX-quantized embedding model the preferred implementation path.
+
