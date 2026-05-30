@@ -94,9 +94,10 @@ async def route_and_retrieve(
         docs = corpus.search(query, company_hint=None, top_k=5)
 
     # --- LLM edge-case routing ---
-    # If BM25 returned nothing or very low confidence, ask the LLM to help
-    # disambiguate the company/product area so we can retry with a better hint.
-    if not docs or docs[0][0] < 2.0:
+    # Only call LLM when BM25 is genuinely uncertain (no docs OR very low score)
+    # AND we don't already have a clear company hint to avoid burning API quota.
+    # Threshold 8.0: scores below this mean BM25 found nothing useful at all.
+    if not company_filter and (not docs or docs[0][0] < 8.0):
         llm_hint = await _llm_route_fallback(facts)
         if llm_hint and llm_hint != company_filter:
             retry_query = build_retrieval_query(facts, llm_hint)
