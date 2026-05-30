@@ -39,7 +39,7 @@ SEED = 42
 MAX_TOKENS = 512
 
 # Rate-limit guard — max concurrent LLM requests
-_MAX_CONCURRENT = 10  # Smaller batches to avoid token spikes
+_MAX_CONCURRENT = 20  # Allows enough concurrency for fast execution
 _semaphore: Optional[asyncio.Semaphore] = None
 
 # Retry config for 429 / transient errors
